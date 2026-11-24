@@ -1,0 +1,7 @@
+.build/
+.swiftpm/
+build/
+*.xcuserstate
+.DS_Store
+settings.local.json
+docs/internal/
