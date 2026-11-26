@@ -69,6 +69,13 @@ final class AppModel {
     /// 다시 그릴 계기가 없는 자리에서는 처음 읽은 값에 머뭅니다. 그래서 상태로 들고 있습니다.
     var disk: Format.DiskUsage = Format.disk()
 
+    /// Sweep이 지우지 않는 큰 항목입니다. 스캔이 끝난 뒤 따로 모읍니다.
+    var insights: [Insight] = []
+    /// 실행 확인을 기다리는 정리 명령입니다.
+    var pendingActionID: String?
+    /// 실행 중인 정리 명령입니다.
+    var runningActionID: String?
+
     /// 여유 공간이 줄었을 때 알릴지입니다.
     var lowDiskAlertEnabled: Bool = UserDefaults.standard.object(forKey: "lowDiskAlertEnabled") as? Bool ?? true {
         didSet { UserDefaults.standard.set(lowDiskAlertEnabled, forKey: "lowDiskAlertEnabled") }
@@ -242,6 +249,40 @@ final class AppModel {
 
         if notifyWhenDone { notifyScanResult(scanned) }
         checkForNewRoots()
+        refreshInsights()
+    }
+
+    // MARK: - 지우지 않는 큰 항목
+
+    /// 큰 항목을 다시 모읍니다. 외부 명령을 몇 개 부르니 메인 스레드 밖에서 돕니다.
+    func refreshInsights() {
+        Task { @MainActor [weak self] in
+            // 앱에서는 다른 앱의 Containers 폴더와 휴지통을 읽지 않습니다. 읽으면 macOS가
+            // "다른 앱의 데이터에 접근" 권한 창을 띄울 수 있습니다.
+            let found = await Task.detached(priority: .utility) {
+                InsightScanner.scan(includeOtherAppData: false)
+            }.value
+            self?.insights = found
+        }
+    }
+
+    /// 정리 명령을 실행합니다. 확인을 한 번 거친 뒤에만 부릅니다.
+    func runAction(_ insight: Insight) async {
+        guard let action = insight.action, runningActionID == nil else { return }
+        pendingActionID = nil
+        runningActionID = insight.id
+        let result = await Task.detached(priority: .userInitiated) { InsightScanner.run(action) }.value
+        runningActionID = nil
+        if result.succeeded {
+            lastMessage = L("\(action.title) 완료", "\(action.title) done")
+            lastMessageIsWarning = false
+        } else {
+            let reason = result.output.split(separator: "\n").last.map(String.init) ?? ""
+            lastMessage = L("\(action.title) 실패: \(reason)", "\(action.title) failed: \(reason)")
+            lastMessageIsWarning = true
+        }
+        refreshDisk()
+        refreshInsights()
     }
 
     // MARK: - 선택

@@ -60,8 +60,11 @@ struct MenuView: View {
                 rows += 1 + (model.expandedLocked.contains(category) ? locked : 0)
             }
         }
+        // 큰 항목은 설명이 붙어 행이 높습니다. 대략 세 줄로 잡습니다.
+        let insightHeight = model.insights.isEmpty ? 0
+            : RowHeight.header + CGFloat(model.insights.count) * RowHeight.candidate * 2.6
         // 스캔 중이라 아직 결과가 없을 때도 빈칸으로 쪼그라들지 않게 최소 높이를 둡니다.
-        return max(120, CGFloat(headers) * RowHeight.header + CGFloat(rows) * RowHeight.candidate + 6)
+        return max(120, CGFloat(headers) * RowHeight.header + CGFloat(rows) * RowHeight.candidate + insightHeight + 6)
     }
 
     var body: some View {
@@ -81,6 +84,9 @@ struct MenuView: View {
                             if !items.isEmpty {
                                 categorySection(category, items: items)
                             }
+                        }
+                        if !model.insights.isEmpty {
+                            insightSection
                         }
                     }
                     .padding(.bottom, 6)
@@ -429,6 +435,30 @@ struct MenuView: View {
         }
     }
 
+    // MARK: - 지우지 않는 큰 항목
+
+    /// Sweep이 지우지 않는 큰 항목입니다. 체크할 수 없고, 도구 정리 명령이 있으면 버튼만 둡니다.
+    private var insightSection: some View {
+        Section {
+            ForEach(model.insights) { insight in
+                InsightRow(insight: insight, model: model)
+            }
+        } header: {
+            HStack(spacing: 6) {
+                Image(systemName: "info.circle")
+                    .font(MenuFont.meta)
+                    .foregroundStyle(.secondary)
+                    .frame(width: Column.check)
+                Text(L("지우지 않는 큰 항목", "Large Items Sweep Leaves")).font(MenuFont.row).fontWeight(.semibold)
+                Spacer()
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
+            .background(.bar)
+        }
+    }
+
     // MARK: - 푸터
 
     private var footer: some View {
@@ -505,6 +535,84 @@ struct MenuView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
+    }
+}
+
+// MARK: - 큰 항목 한 줄
+
+/// 지우지 않는 큰 항목 하나입니다. 이름, 크기, 줄이는 방법을 보여 줍니다.
+///
+/// 정리 명령은 두 번 눌러야 실행됩니다. 후보 삭제와 같은 확인 단계를 둡니다.
+private struct InsightRow: View {
+    let insight: Insight
+    let model: AppModel
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: symbol)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .frame(width: Column.check)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(insight.title).font(MenuFont.row)
+                Text(insight.detail)
+                    .font(MenuFont.meta)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let action = insight.action { actionButton(action) }
+            }
+            Spacer(minLength: 8)
+            Text(insight.bytes.map(Format.bytes) ?? "")
+                .font(.system(.callout, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: Column.size, alignment: .trailing)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
+        .contextMenu {
+            if let path = insight.path {
+                Button(L("Finder에서 보기", "Show in Finder")) {
+                    NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func actionButton(_ action: ToolAction) -> some View {
+        HStack(spacing: 6) {
+            if model.runningActionID == insight.id {
+                ProgressView().controlSize(.mini)
+                Text(L("실행 중", "Running")).font(MenuFont.meta).foregroundStyle(.secondary)
+            } else if model.pendingActionID == insight.id {
+                Button(L("실행", "Run")) { Task { await model.runAction(insight) } }
+                    .buttonStyle(.borderedProminent)
+                Button(L("취소", "Cancel")) { model.pendingActionID = nil }
+                    .buttonStyle(.bordered)
+                Text(action.commandLine).font(MenuFont.meta).foregroundStyle(.tertiary).lineLimit(1)
+            } else {
+                Button(action.title + "…") { model.pendingActionID = insight.id }
+                    .buttonStyle(.bordered)
+                    .disabled(model.runningActionID != nil || model.isSweeping)
+            }
+        }
+        .controlSize(.small)
+        .padding(.top, 2)
+    }
+
+    private var symbol: String {
+        switch insight.kind {
+        case .virtualMachine: return "desktopcomputer"
+        case .docker:         return "shippingbox"
+        case .simulators:     return "iphone"
+        case .localSnapshots: return "clock.arrow.circlepath"
+        case .purgeable:      return "arrow.3.trianglepath"
+        case .trash:          return "trash"
+        case .xcodeArchives:  return "archivebox"
+        case .agentImage:     return "cpu"
+        case .installers:     return "arrow.down.doc"
+        }
     }
 }
 
