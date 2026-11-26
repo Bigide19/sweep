@@ -23,7 +23,7 @@
 
 디스크가 꽉 찼을 때 용량은 쉽게 알 수 있습니다. 어려운 건 지우고 나면 무엇을 다시 해야 하는지 모른다는 점입니다. Sweep은 후보마다 다시 만드는 데 드는 비용을 붙여서 보여주고, 무엇을 지울지는 직접 고르게 합니다.
 
-Xcode DerivedData, Gradle과 npm 캐시, NuGet 패키지, Rust `target`, `.next`, `.build`를 비롯해 프로젝트 안의 빌드 폴더를 찾습니다. 전체 목록은 [룰 레퍼런스](docs/rules.md)에 있습니다.
+Xcode DerivedData와 기기 지원 파일, Gradle, npm, Cargo, Maven 캐시, NuGet 패키지, 로컬 AI 모델, 오래 손대지 않은 프로젝트의 `node_modules`, Rust `target`, `.next`, `.build`를 비롯해 프로젝트 안의 빌드 폴더를 찾습니다. 전체 목록은 [룰 레퍼런스](docs/rules.md)에 있습니다.
 
 ## 설치
 
@@ -39,16 +39,19 @@ cd sweep/app
 
 ## 하는 일
 
-- **다시 만드는 비용을 보여줍니다.** 후보마다 즉시 재빌드, 2분 안팎, 10분 이상, 재다운로드 중 하나가 붙습니다. 같은 1GB라도 지우는 부담이 다릅니다.
+- **다시 만드는 비용을 보여줍니다.** 후보마다 즉시 재빌드, 2분 안팎, 10분 이상, 재다운로드, 패키지 재설치 중 하나가 붙습니다. 같은 1GB라도 지우는 부담이 다릅니다.
 - **오래 방치한 것부터 고릅니다.** 마지막으로 수정한 지 며칠이 지났는지 보고 기본 선택을 정합니다. 어제 받은 npm 캐시와 1년 묵은 빌드를 같이 취급하지 않습니다.
 - **실제 상태를 보고 지워도 되는지 확인합니다.** `build`라는 이름만으로는 산출물인지 직접 쓴 파일인지 알 수 없습니다. 그래서 git이 추적하는 경로, 커밋하지 않은 변경이 든 폴더, 사용 중인 캐시는 막습니다.
+- **작업 중인 프로젝트는 건드리지 않습니다.** 개발 서버나 에이전트 세션이 그 프로젝트에서 돌고 있으면 산출물을 막고 지우기 직전에 한 번 더 확인합니다.
 - **모르는 것은 건드리지 않습니다.** `~/Library/Caches`에서 목록에 없는 항목은 크기만 보여주고 잠급니다.
+- **지우지 않는 큰 항목도 알려줍니다.** VM 이미지, Docker 디스크 이미지, 쓸 수 없는 시뮬레이터, 로컬 스냅샷은 크기와 줄이는 방법만 보여줍니다. 도구에 정리 명령이 있으면(Docker build cache, `simctl delete unavailable`) 그 명령을 대신 실행할 수 있습니다.
 
 <details>
-<summary>안전 검사 9가지 전체 보기</summary>
+<summary>안전 검사 10가지 전체 보기</summary>
 
 | 검사 | 결과 |
 |---|---|
+| 그 프로젝트에서 프로세스가 실행 중(개발 서버, 에이전트 세션) | 차단 |
 | git이 추적하는 경로 | 차단 |
 | 커밋하지 않은 변경이 들어 있음 | 차단 |
 | 그 캐시를 쓰는 프로세스가 실행 중 | 차단 |
@@ -59,7 +62,7 @@ cd sweep/app
 | git 저장소 밖의 빌드 산출물 | 경고, 기본 선택 해제 |
 | 최근에 커밋한 프로젝트 | 경고. 재빌드가 오래 걸리는 것만 |
 
-`dist`와 `Pods`는 손으로 관리하는 폴더일 수 있어서 미리 체크하지 않습니다.
+`dist`와 `Pods`는 손으로 관리하는 폴더일 수 있어서 미리 체크하지 않습니다. `node_modules`는 90일 넘게 커밋이 없고 lockfile이 있고 사설 registry를 쓰지 않는 프로젝트일 때만 미리 체크합니다.
 
 </details>
 
@@ -86,6 +89,8 @@ cd sweep/app
 
 랜섬웨어 방어 프로그램이 삭제를 막으면 허용 창에서 허용하면 됩니다. 막힌 항목이 있으면 패널에 그 파일 이름과 남은 용량이 표시됩니다.
 
+남은 공간이 10%나 10GB 아래로 내려가면 알림을 한 번 보냅니다. 남은 공간이 15%와 15GB 위로 돌아온 뒤에야 다시 알립니다. `⋯` 메뉴에서 끌 수 있습니다.
+
 검사할 폴더와 제외할 경로, 룰마다 켜고 끄는 설정은 `⋯` 메뉴의 룰 설정 창에서 바꿉니다. 화면 언어(한국어, English)도 같은 메뉴에 있습니다.
 
 <img src="docs/images/rules.png" alt="룰 설정 창" width="546" />
@@ -96,8 +101,10 @@ cd sweep/app
 ```bash
 cd app && swift build -c release
 
-.build/release/sweep scan          # 후보 목록
+.build/release/sweep scan          # 후보 목록 (--json은 스크립트용)
 .build/release/sweep clean --yes   # 기본 선택된 후보 삭제
+.build/release/sweep clean --path ~/Projects/app/node_modules --yes   # 경로로 골라서
+.build/release/sweep report        # 지우지 않는 큰 항목과 줄이는 방법
 .build/release/sweep rules         # 적용 중인 룰
 .build/release/sweep history       # 삭제 이력
 .build/release/sweep verify        # 룰 회귀 검증
