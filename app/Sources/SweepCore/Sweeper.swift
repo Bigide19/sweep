@@ -15,6 +15,10 @@ public struct Sweeper: Sendable {
         public var reclaimedBytes: Int64 = 0
         /// 멈춤 요청을 받아 처리하지 않고 남긴 항목 수입니다.
         public var skipped = 0
+        /// 삭제 전후의 남은 공간입니다. 다른 프로그램도 디스크를 쓰므로 회수량과 같지 않습니다.
+        /// 하드링크 공유처럼 회수량이 부풀려진 경우를 짐작하는 참고값입니다. 시험 삭제면 nil입니다.
+        public var freeBefore: Int64?
+        public var freeAfter: Int64?
     }
 
     /// 항목 하나를 처리한 결과입니다.
@@ -39,7 +43,12 @@ public struct Sweeper: Sendable {
                       progress: (@Sendable (Candidate) -> Void)? = nil,
                       finished: (@Sendable (Candidate, ItemResult) -> Void)? = nil) -> Outcome {
         var outcome = Outcome()
-        if !dryRun { Self.purgeStaging() }
+        if !dryRun {
+            Self.purgeStaging()
+            outcome.freeBefore = Format.disk().free
+        }
+        // 바깥과 안쪽 후보가 함께 넘어오면 바깥만 지웁니다. 안쪽은 바깥과 함께 사라집니다.
+        let candidates = Candidate.withoutNested(candidates)
 
         for (index, candidate) in candidates.enumerated() {
             if Task.isCancelled {
@@ -67,6 +76,17 @@ public struct Sweeper: Sendable {
                 continue
             }
 
+            // 스캔한 뒤 그 프로젝트에서 개발 서버나 세션을 띄웠을 수 있습니다. 앱은 몇 시간 전
+            // 스캔 결과로 지우기도 해서, 프로젝트 산출물은 지우기 직전에 다시 봅니다.
+            if candidate.category == .projectOutput,
+               let reason = SafetyGuards.activeProcessReason(
+                   for: candidate.path, list: ProcessInspector.workingProcesses(),
+                   containers: SafetyGuards.containerRoots(RuleEngine.loadRuleSet())) {
+                outcome.refused.append((candidate, reason))
+                finished?(candidate, ItemResult(removed: false, freedBytes: 0, error: reason))
+                continue
+            }
+
             progress?(candidate)
 
             if dryRun {
@@ -89,6 +109,7 @@ public struct Sweeper: Sendable {
                                                  succeeded: result.error == nil, error: result.error)])
             finished?(candidate, result)
         }
+        if !dryRun { outcome.freeAfter = Format.disk().free }
         return outcome
     }
 

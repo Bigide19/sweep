@@ -22,6 +22,77 @@ func value(for flag: String) -> String? {
     return arguments[index + 1]
 }
 
+/// 여러 번 줄 수 있는 플래그의 값을 모두 모읍니다. 쉼표로 묶어 줘도 됩니다.
+func values(for flag: String) -> [String] {
+    var result: [String] = []
+    for (index, argument) in arguments.enumerated() where argument == flag && index + 1 < arguments.count {
+        result += arguments[index + 1].split(separator: ",").map {
+            SweepScanner.expand($0.trimmingCharacters(in: .whitespaces))
+        }
+    }
+    return result
+}
+
+/// 스크립트에서 읽을 수 있는 형태입니다. 번호는 사람이 읽는 목록과 같은 순서입니다.
+struct JSONCandidate: Encodable {
+    let index: Int
+    let path: String
+    let ruleID: String
+    let category: String
+    let cost: String
+    let bytes: Int64
+    let sharedBytes: Int64
+    let idleDays: Int?
+    let deletable: Bool
+    let defaultSelected: Bool
+    let blockReason: String?
+    let warnings: [String]
+
+    // 값이 없어도 키는 남깁니다. 기본 인코딩은 nil인 키를 빼서 읽는 쪽이 키 유무를 따져야 합니다.
+    enum CodingKeys: String, CodingKey {
+        case index, path, ruleID, category, cost, bytes, sharedBytes, idleDays,
+             deletable, defaultSelected, blockReason, warnings
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(index, forKey: .index)
+        try container.encode(path, forKey: .path)
+        try container.encode(ruleID, forKey: .ruleID)
+        try container.encode(category, forKey: .category)
+        try container.encode(cost, forKey: .cost)
+        try container.encode(bytes, forKey: .bytes)
+        try container.encode(sharedBytes, forKey: .sharedBytes)
+        try container.encode(idleDays, forKey: .idleDays)
+        try container.encode(deletable, forKey: .deletable)
+        try container.encode(defaultSelected, forKey: .defaultSelected)
+        try container.encode(blockReason, forKey: .blockReason)
+        try container.encode(warnings, forKey: .warnings)
+    }
+}
+
+func printJSON(_ result: ScanResult) {
+    let items = orderedCandidates(result).enumerated().map { offset, c in
+        JSONCandidate(index: offset + 1, path: c.path, ruleID: c.ruleID, category: c.category.rawValue,
+                      cost: c.cost.rawValue, bytes: c.bytes, sharedBytes: c.sharedBytes,
+                      idleDays: c.idleDays, deletable: c.isDeletable,
+                      defaultSelected: c.defaultSelected,
+                      blockReason: c.blockReason ?? (c.unclassified ? "unclassified" : nil),
+                      warnings: c.warnings)
+    }
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+    if let data = try? encoder.encode(items), let text = String(data: data, encoding: .utf8) {
+        print(text)
+    }
+}
+
+/// 화면 목록과 같은 순서입니다. `--index` 번호가 이 순서를 따릅니다.
+func orderedCandidates(_ result: ScanResult) -> [Candidate] {
+    SweepCategory.allCases.sorted { $0.order < $1.order }
+        .flatMap { category in result.candidates.filter { $0.category == category } }
+}
+
 // MARK: - 목록 출력
 
 func printResult(_ result: ScanResult) {
@@ -38,7 +109,7 @@ func printResult(_ result: ScanResult) {
         let items = result.candidates.filter { $0.category == category }
         guard !items.isEmpty else { continue }
 
-        let sum = items.filter { $0.isDeletable }.reduce(Int64(0)) { $0 + $1.bytes }
+        let sum = Candidate.withoutNested(items.filter { $0.isDeletable }).reduce(Int64(0)) { $0 + $1.bytes }
         print("")
         print("  \(Ansi.cyan)▸ \(category.label)\(Ansi.reset)  \(Ansi.dim)\(Format.bytes(sum))\(Ansi.reset)")
 
@@ -93,7 +164,7 @@ func runScan() async {
         FileHandle.standardError.write("스캔 중...\n".data(using: .utf8)!)
     }
     let result = await scanner.scan()
-    printResult(result)
+    if flags.contains("--json") { printJSON(result) } else { printResult(result) }
 }
 
 func runVerify() async {
@@ -126,6 +197,15 @@ func runVerify() async {
         ("~/Library/Application Support/Claude/Code Cache", .allow, "ai-claude-desktop-cache"),
         ("~/Library/Caches/claude-cli-nodejs", .allow, "ai-claude-cli-logs"),
         ("~/.cache/github-copilot", .allow, "ai-copilot-index"),
+        ("~/Projects/node-app/node_modules", .allow, "node-modules"),
+        ("~/Projects/monorepo/packages/web/node_modules", .allow, "node-modules"),
+        ("~/Library/Developer/Xcode/iOS DeviceSupport/17.5 (21F79)", .allow, "xcode-device-support"),
+        ("~/Library/Developer/Xcode/watchOS DeviceSupport/Watch6,1 10.4 (21T216)", .allow, "xcode-device-support"),
+        ("~/.cargo/registry", .allow, "cargo-registry"),
+        ("~/.m2/repository", .allow, "maven-repo"),
+        ("~/.pub-cache/hosted", .allow, "pub-cache"),
+        ("~/.cache/huggingface", .allow, "ai-local-models"),
+        ("~/.ollama/models", .allow, "ai-local-models"),
 
         // 건드리면 안 되는 것. 아래 셋은 실제로 걸러냈던 함정입니다.
         ("~/Projects/node-app/web/node_modules/next/dist/build", .deny, "node-package-code"),
@@ -133,6 +213,8 @@ func runVerify() async {
         ("~/Projects/dotnet-app/AgentApp/packages/Stub.System.Data.SQLite.Core.NetFramework.1.0.119.0/build", .deny, "nuget-package-dir"),
         ("~/Projects/node-app/venv/lib/python3.13/site-packages/pip/_internal/operations/build", .deny, "python-packages"),
         ("~/Library/Android/sdk/build-tools/34.0.0/build", .deny, "android-sdk"),
+        // npm i -g로 깐 CLI입니다. 다시 깔아 줄 프로젝트가 없습니다.
+        ("~/.nvm/versions/node/v22.0.0/lib/node_modules", .deny, "node-global-packages"),
         // 훑기만 해도 미디어 보관함 접근 경고가 뜨는 경로들입니다.
         ("~/Library/Caches/com.apple.Music", .deny, "apple-system-cache"),
         ("~/Library/Caches/com.apple.AMPLibraryAgent", .deny, "apple-system-cache"),
@@ -227,7 +309,8 @@ func runVerify() async {
                                   category: .projectOutput, cost: .instant,
                                   display: "build")
         let guarded = await SafetyGuards().apply(to: [candidate])
-        if guarded.first?.blocked == true {
+        // 사유까지 봅니다. 다른 검사(작업 중인 프로세스 등)에 걸려 막힌 것이면 이 검사를 확인한 게 아닙니다.
+        if guarded.first?.blocked == true, guarded.first?.blockReason == L("git이 추적하는 소스", "Tracked by git") {
             passed += 1
             print("  \(Ansi.green)통과\(Ansi.reset)  룰은 \(decision.rule?.id ?? "-")(allow)로 봤지만 안전장치가 막았습니다")
             print("        \(Ansi.dim)\(guarded.first?.blockReason ?? "")\(Ansi.reset)")
@@ -248,7 +331,8 @@ func runVerify() async {
                                   category: .projectOutput, cost: .quick,
                                   display: SweepScanner.abbreviate(selfDir))
         let guarded = await SafetyGuards().apply(to: [candidate])
-        if guarded.first?.blocked == true {
+        if guarded.first?.blocked == true,
+           guarded.first?.blockReason == L("실행 중인 Sweep이 들어 있음", "Contains the running Sweep") {
             passed += 1
             print("  \(Ansi.green)통과\(Ansi.reset)  실행 중인 자기 자신을 막았습니다")
             print("        \(Ansi.dim)\(guarded.first?.blockReason ?? "")\(Ansi.reset)  \(SweepScanner.abbreviate(selfDir))")
@@ -333,6 +417,31 @@ func runVerify() async {
         print("  \(Ansi.dim)건너뜀\(Ansi.reset)  룰 파일이 없습니다")
     }
 
+    // 중첩된 node_modules는 바깥 것에 포함되므로 따로 후보가 되면 안 됩니다.
+    check("중첩된 node_modules는 따로 잡지 않습니다",
+          engine.decide(SweepScanner.expand("~/Projects/node-app/node_modules/expo/node_modules")).rule?.id != "node-modules")
+
+    await runWorkingProjectChecks(check: check)
+
+    print("")
+    print("  \(Ansi.bold)저용량 알림과 도구 출력 검증\(Ansi.reset)")
+    print("")
+    // 임계치 아래로 내려간 순간 한 번만 알리고, 충분히 회복한 뒤에야 다시 알립니다.
+    let gb: Int64 = 1024 * 1024 * 1024
+    let total = 500 * gb
+    let first = LowDiskAlert.evaluate(free: 40 * gb, total: total, alerted: false)
+    let again = LowDiskAlert.evaluate(free: 35 * gb, total: total, alerted: first.alerted)
+    let edge = LowDiskAlert.evaluate(free: 60 * gb, total: total, alerted: again.alerted)
+    let recovered = LowDiskAlert.evaluate(free: 100 * gb, total: total, alerted: edge.alerted)
+    let next = LowDiskAlert.evaluate(free: 45 * gb, total: total, alerted: recovered.alerted)
+    check("여유가 10% 아래로 내려가면 한 번 알립니다", first.notify && first.alerted)
+    check("아래에 머무는 동안은 다시 알리지 않습니다", !again.notify)
+    check("경계(10~15%)에서는 상태를 유지합니다", !edge.notify && edge.alerted)
+    check("15% 이상으로 회복한 뒤 다시 내려가면 또 알립니다", !recovered.alerted && next.notify)
+    // 큰 디스크는 10%가 수백 GB라 비율만으로는 늦습니다. 10GB 아래도 부족으로 봅니다.
+    let big = LowDiskAlert.evaluate(free: 8 * gb, total: 8 * 1024 * gb, alerted: false)
+    check("비율이 넉넉해도 10GB 아래면 알립니다", big.notify)
+
     print("")
     print("  \(Ansi.bold)선택 정책 검증\(Ansi.reset)")
     print("")
@@ -381,25 +490,249 @@ func runVerify() async {
     if failed > 0 { exit(1) }
 }
 
+// MARK: - 작업 중인 프로젝트와 node_modules 검증
+
+/// 임시 저장소로 안전장치를 끝까지 재현합니다.
+///
+/// 모양은 `<검사 폴더>/group/app`입니다. app은 200일 전에 커밋한 저장소이고, 안에
+/// node_modules와 그 안의 RN android/build가 있습니다. 실제 프로젝트를 건드리지 않으려고
+/// 검사 폴더를 Sweep 데이터 폴더 아래에 따로 만들고, 그 폴더만 훑는 룰셋으로 스캔합니다.
+func runWorkingProjectChecks(check: (String, Bool) -> Void) async {
+    print("")
+    print("  \(Ansi.bold)작업 중인 프로젝트 검증\(Ansi.reset)")
+    print("")
+
+    let fm = FileManager.default
+    let container = fm.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/Sweep/verify-work-\(ProcessInfo.processInfo.processIdentifier)")
+        .resolvingSymlinksInPath()
+    let group = container.appendingPathComponent("group")
+    let app = group.appendingPathComponent("app")
+    let nodeModules = app.appendingPathComponent("node_modules")
+    let rnBuild = nodeModules.appendingPathComponent("rn-lib/android/build")
+    defer { try? fm.removeItem(at: container) }
+
+    guard let gitPath = ["/usr/bin/git", "/opt/homebrew/bin/git"].first(where: { fm.isExecutableFile(atPath: $0) }) else {
+        check("검사용 git을 찾지 못했습니다", false)
+        return
+    }
+    let old = Date().addingTimeInterval(-200 * 86_400)
+    @discardableResult
+    func git(_ args: [String], date: Date? = nil) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: gitPath)
+        process.arguments = ["-c", "user.name=sweep", "-c", "user.email=sweep@localhost",
+                             "-c", "commit.gpgsign=false"] + args
+        process.currentDirectoryURL = app
+        if let date {
+            let stamp = "@\(Int(date.timeIntervalSince1970)) +0000"
+            process.environment = ["GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp]
+        }
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return false }
+        process.waitUntilExit()
+        return process.terminationStatus == 0
+    }
+    func write(_ text: String, _ name: String) {
+        try? text.write(to: app.appendingPathComponent(name), atomically: true, encoding: .utf8)
+    }
+    /// 최소 후보 크기(1MB)를 넘기려고 2MB짜리 파일을 둡니다.
+    func blob(_ url: URL) {
+        try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        fm.createFile(atPath: url.path, contents: Data(count: 2 * 1024 * 1024))
+    }
+    /// 오래 방치한 것처럼 수정 시각을 되돌립니다. 선택 정책이 유휴일로 고르기 때문입니다.
+    func age(_ url: URL) {
+        let items = (fm.enumerator(atPath: url.path)?.allObjects as? [String]) ?? []
+        for item in items + [""] {
+            let path = item.isEmpty ? url.path : url.appendingPathComponent(item).path
+            try? fm.setAttributes([.modificationDate: old], ofItemAtPath: path)
+        }
+    }
+
+    do {
+        try fm.createDirectory(at: app, withIntermediateDirectories: true)
+    } catch {
+        check("임시 저장소를 만들지 못했습니다", false)
+        return
+    }
+    write("{\"name\":\"app\"}\n", "package.json")
+    write("{\"lockfileVersion\":3}\n", "package-lock.json")
+    write("node_modules/\n", ".gitignore")
+    blob(nodeModules.appendingPathComponent("pkg/index.js"))
+    blob(rnBuild.appendingPathComponent("out.bin"))
+    // 하나는 바깥 파일과 링크를 공유하고, 하나는 두 링크가 모두 node_modules 안에 있습니다.
+    let outside = container.appendingPathComponent("outside.bin")
+    blob(outside)
+    try? fm.linkItem(at: outside, to: nodeModules.appendingPathComponent("pkg/shared.bin"))
+    blob(nodeModules.appendingPathComponent("pkg/inner-a.bin"))
+    try? fm.linkItem(at: nodeModules.appendingPathComponent("pkg/inner-a.bin"),
+                     to: nodeModules.appendingPathComponent("pkg/inner-b.bin"))
+    age(nodeModules)
+    guard git(["init", "--quiet"]), git(["add", "."]),
+          git(["commit", "--quiet", "-m", "fixture"], date: old) else {
+        check("임시 저장소에 커밋하지 못했습니다", false)
+        return
+    }
+
+    let ruleSet = RuleSet(version: 1, roots: [ScanRoot(path: container.path, mode: .walk)],
+                          dirNames: DefaultRuleSet.dirNames, rules: DefaultRuleSet.rules)
+    func scan() async -> [Candidate] {
+        await SweepScanner(engine: RuleEngine(ruleSet: ruleSet), policy: .balanced).scan().candidates
+    }
+    func find(_ list: [Candidate], _ url: URL) -> Candidate? { list.first { $0.path == url.path } }
+    /// 작업 폴더를 지정해 sleep을 띄웁니다. 개발 서버나 에이전트 세션을 흉내 냅니다.
+    func spawn(in directory: URL) -> Process? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        process.arguments = ["60"]
+        process.currentDirectoryURL = directory
+        do { try process.run() } catch { return nil }
+        return process
+    }
+    func stop(_ process: Process?) {
+        process?.terminate()
+        process?.waitUntilExit()
+    }
+
+    // 1. 아무것도 돌지 않는 오래된 프로젝트
+    let idle = await scan()
+    let modules = find(idle, nodeModules)
+    let inner = find(idle, rnBuild)
+    check("오래된 프로젝트의 node_modules를 후보로 올리고 미리 체크합니다",
+          modules?.isDeletable == true && modules?.defaultSelected == true)
+    check("node_modules 안의 RN android/build도 따로 남깁니다", inner?.isDeletable == true)
+    if let modules, let inner {
+        let merged = Candidate.withoutNested([modules, inner])
+        check("둘을 함께 고르면 바깥만 남겨 두 번 세지 않습니다",
+              merged.count == 1 && merged.first?.path == modules.path)
+    }
+    // 바깥과 공유하는 2MB만 공유로 잡혀야 합니다. 안쪽끼리 링크된 파일은 한 번만 세고 공유가 아닙니다.
+    let shared = modules?.sharedBytes ?? 0
+    check("바깥과 하드링크를 공유하는 몫만 따로 셉니다",
+          shared >= 2 * 1024 * 1024 && shared < 4 * 1024 * 1024)
+
+    // 바깥과 안쪽을 함께 넘겨도 바깥 하나만 처리합니다. 안쪽을 따로 지우려다 "이미 없는 경로"로 실패하지 않습니다.
+    if let modules, let inner {
+        let outcome = Sweeper().sweep([inner, modules], dryRun: true)
+        check("삭제할 때도 바깥 후보 하나만 처리합니다",
+              outcome.deleted.map(\.path) == [modules.path] && outcome.refused.isEmpty)
+    }
+
+    // 2. 프로젝트 안에서 프로세스가 돌 때
+    var process = spawn(in: app)
+    let busy = await scan()
+    let busyReason = find(busy, nodeModules)?.blockReason ?? ""
+    check("프로젝트 안에서 프로세스가 돌면 막습니다 (\(busyReason))",
+          find(busy, nodeModules)?.blocked == true && busyReason.contains("sleep"))
+    check("같은 프로젝트의 다른 산출물도 막습니다",
+          find(busy, rnBuild)?.blockReason?.contains("sleep") == true)
+    // 스캔 때는 비어 있던 프로젝트라도 지우기 직전에 다시 봅니다.
+    if let modules {
+        let outcome = Sweeper().sweep([modules], dryRun: true)
+        check("스캔 뒤에 띄운 프로세스도 삭제 직전에 막습니다",
+              outcome.deleted.isEmpty && outcome.refused.first?.reason.contains("sleep") == true)
+    }
+    stop(process)
+
+    // 3. 프로젝트의 상위 폴더에서 도는 프로세스. 여러 저장소를 함께 다루는 세션이 이렇습니다.
+    process = spawn(in: group)
+    check("검사 폴더보다 깊은 상위 폴더에서 돌면 막습니다",
+          find(await scan(), nodeModules)?.blockReason?.contains("sleep") == true)
+    stop(process)
+
+    // 3-1. 작업 폴더는 다른 곳인데 그 프로젝트의 파일을 실행하는 프로세스. 절대 경로로 띄운 MCP 서버가 이렇습니다.
+    let script = Process()
+    script.executableURL = URL(fileURLWithPath: "/bin/sh")
+    // 명령이 하나뿐이면 sh가 sleep으로 바뀌어 인수가 사라집니다. 두 개로 둬서 sh가 남게 합니다.
+    script.arguments = ["-c", "sleep 60; true", app.appendingPathComponent("server.js").path]
+    script.currentDirectoryURL = fm.homeDirectoryForCurrentUser
+    try? script.run()
+    check("커맨드라인에 프로젝트 경로가 든 프로세스도 막습니다",
+          find(await scan(), nodeModules)?.blockReason?.contains("sh") == true)
+    stop(script)
+
+    // 4. 검사 폴더 자체에서 도는 프로세스는 아래 전체를 쓰는 게 아닙니다.
+    process = spawn(in: container)
+    check("검사 폴더 자체에서 도는 프로세스로는 막지 않습니다",
+          find(await scan(), nodeModules)?.blocked == false)
+    stop(process)
+
+    // 5. 사설 registry. scope registry는 그 scope의 패키지를 실제로 쓸 때만 칩니다.
+    write("@corp:registry=https://npm.corp.example/\n", ".npmrc")
+    let unusedScope = find(await scan(), nodeModules)
+    check("쓰지 않는 scope의 registry는 사설 registry로 보지 않습니다",
+          unusedScope?.defaultSelected == true)
+    write("{\"name\":\"app\",\"dependencies\":{\"@corp/ui\":\"1.0.0\"}}\n", "package.json")
+    let privateRegistry = find(await scan(), nodeModules)
+    check("사설 registry의 패키지를 쓰면 미리 체크하지 않습니다",
+          privateRegistry?.defaultSelected == false
+          && privateRegistry?.warnings.contains { $0.contains("registry") } == true)
+    try? fm.removeItem(at: app.appendingPathComponent(".npmrc"))
+    git(["checkout", "--quiet", "--", "package.json"])
+
+    // 6. lockfile 없음
+    try? fm.removeItem(at: app.appendingPathComponent("package-lock.json"))
+    let noLock = find(await scan(), nodeModules)
+    check("lockfile이 없으면 미리 체크하지 않습니다",
+          noLock?.defaultSelected == false && noLock?.warnings.contains { $0.contains("lockfile") } == true)
+    git(["checkout", "--quiet", "--", "package-lock.json"])
+
+    // 7. 최근 커밋
+    git(["commit", "--quiet", "--allow-empty", "-m", "recent"])
+    let recent = find(await scan(), nodeModules)
+    check("최근에 커밋한 프로젝트는 미리 체크하지 않습니다",
+          recent?.isDeletable == true && recent?.defaultSelected == false)
+
+    // 저장소 밖에서도 node_modules 안의 후보는 바깥 node_modules를 품은 폴더를 프로젝트로 봅니다.
+    check("저장소 밖 node_modules 안 후보의 프로젝트는 node_modules를 품은 폴더입니다",
+          SafetyGuards.projectDirectory(for: "/opt/verify/app/node_modules/rn/android/build") == "/opt/verify/app")
+
+    // 8. Xcode 기기 지원 파일은 플랫폼마다 가장 최신 버전을 남깁니다. 경로는 없어도 됩니다.
+    let base = SweepScanner.expand("~/Library/Developer/Xcode/iOS DeviceSupport/")
+    let versions = ["16.4 (20E247)", "iPhone15,2 17.0 (21A329)", "17.5 (21F79)"].map {
+        Candidate(path: base + $0, ruleID: "xcode-device-support", category: .toolchainCache,
+                  cost: .slow, display: $0, bytes: 1)
+    }
+    let guarded = await SafetyGuards(ruleSet: DefaultRuleSet.ruleSet).apply(to: versions)
+    check("기기 지원 파일은 가장 최신 버전만 미리 체크에서 뺍니다",
+          guarded.filter(\.deselectedBySafety).map(\.display) == ["17.5 (21F79)"])
+}
+
 func runClean() async {
     let scanner = SweepScanner()
     FileHandle.standardError.write("스캔 중...\n".data(using: .utf8)!)
     let result = await scanner.scan()
 
     var targets: [Candidate] = []
-    if let ruleID = value(for: "--rule") {
+    // 번호는 스캔할 때마다 바뀔 수 있습니다. 미리보기와 실제 삭제 사이에 후보가 하나만
+    // 늘어도 다른 항목을 지웁니다. 스크립트에서는 경로로 고르는 쪽이 안전합니다.
+    let paths = values(for: "--path")
+    if !paths.isEmpty {
+        let wanted = Set(paths)
+        targets = result.candidates.filter { wanted.contains($0.path) && $0.isDeletable }
+        let found = Set(targets.map(\.path))
+        for path in paths where !found.contains(path) {
+            print("  \(Ansi.yellow)후보가 아니거나 지울 수 없는 경로입니다: \(SweepScanner.abbreviate(path))\(Ansi.reset)")
+        }
+    } else if let ruleID = value(for: "--rule") {
         targets = result.candidates.filter { $0.ruleID == ruleID && $0.isDeletable }
     } else if let list = value(for: "--index") {
         let wanted = Set(list.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) })
-        let ordered = SweepCategory.allCases.sorted { $0.order < $1.order }
-            .flatMap { category in result.candidates.filter { $0.category == category } }
-        targets = ordered.enumerated()
+        targets = orderedCandidates(result).enumerated()
             .filter { wanted.contains($0.offset + 1) }
             .map { $0.element }
             .filter { $0.isDeletable }
     } else {
         targets = result.candidates.filter { $0.defaultSelected && $0.isDeletable }
     }
+
+    // 제외한 경로와 그 아래는 빼고, 겹친 후보는 바깥만 남깁니다.
+    let excluded = values(for: "--exclude")
+    targets = Candidate.withoutNested(targets.filter { target in
+        !excluded.contains { target.path == $0 || target.path.hasPrefix($0 + "/") }
+    })
 
     guard !targets.isEmpty else {
         print("삭제할 대상이 없습니다.")
@@ -424,6 +757,11 @@ func runClean() async {
 
     let outcome = Sweeper().sweep(targets)
     print("  \(Ansi.green)\(Format.bytes(outcome.reclaimedBytes)) 회수\(Ansi.reset), \(outcome.deleted.count)개 삭제")
+    // 하드링크 공유나 다른 프로그램의 쓰기 때문에 회수량과 다를 수 있습니다. 참고값으로만 보여 줍니다.
+    if let before = outcome.freeBefore, let after = outcome.freeAfter {
+        let delta = after - before
+        print("  \(Ansi.dim)남은 공간 \(delta >= 0 ? "+" : "-")\(Format.bytes(abs(delta))) (다른 프로그램도 디스크를 쓰므로 참고값)\(Ansi.reset)")
+    }
     if !outcome.failed.isEmpty {
         print("  \(Ansi.red)실패 \(outcome.failed.count)개\(Ansi.reset)")
         for (candidate, error) in outcome.failed {
@@ -474,11 +812,13 @@ func usage() {
       sweep - 빌드 산출물과 캐시 정리
 
       사용법
-        sweep scan                 후보 목록을 봅니다 (기본)
+        sweep scan [--json]        후보 목록을 봅니다 (기본)
         sweep clean                기본 선택 항목을 미리 봅니다
         sweep clean --yes          실제로 지웁니다
+        sweep clean --path <경로>  경로로 골라서 (여러 번, 쉼표 가능)
         sweep clean --rule <id>    특정 룰에 걸린 것만
         sweep clean --index 1,3,5  번호로 골라서
+        sweep clean --exclude <경로>  고른 것 중 이 경로 아래는 빼고
         sweep verify               룰 판정과 안전장치를 검증합니다
         sweep rules [--export]     룰 목록 / JSON 내보내기
         sweep history              누적 회수량

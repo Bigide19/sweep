@@ -79,7 +79,7 @@ public final class SweepScanner: @unchecked Sendable {
 
         // 안전장치를 붙입니다. 여기서 blocked가 결정됩니다.
         let owners = gradleOwners.mapValues { Array($0).sorted() }
-        let guards = SafetyGuards(gradleOwners: owners)
+        let guards = SafetyGuards(gradleOwners: owners, ruleSet: engine.ruleSet)
         candidates = await guards.apply(to: candidates)
 
         // 무엇을 체크해둘지는 안전장치가 끝난 뒤에 정합니다. 잠긴 항목과
@@ -142,9 +142,11 @@ public final class SweepScanner: @unchecked Sendable {
                 let decision = engine.decide(full)
                 if decision.isAllowed {
                     raws.append(Raw(path: full, rule: decision.rule, unclassified: false))
-                    continue  // 통째로 지울 대상이라 안을 볼 필요가 없습니다
-                }
-                if decision.isDenied {
+                    // node_modules는 후보로 올린 뒤에도 안을 봅니다. 활성 프로젝트라 통째로는
+                    // 못 지울 때도 안쪽의 RN android/build는 따로 지울 수 있어야 합니다.
+                    // 둘이 겹치는 문제는 합계와 삭제 직전에 Candidate.withoutNested가 풉니다.
+                    guard name == "node_modules" else { continue }
+                } else if decision.isDenied {
                     if let id = decision.rule?.id { deniedCounts[id, default: 0] += 1 }
                     continue  // 건드리지 않을 영역입니다
                 }
@@ -217,24 +219,21 @@ public final class SweepScanner: @unchecked Sendable {
     private func measureAll(_ raws: [Raw], progress: (@Sendable (String) -> Void)?) async -> [Candidate] {
         guard !raws.isEmpty else { return [] }
 
-        var sizes = [(bytes: Int64, files: Int, newest: Date?)](repeating: (0, 0, nil), count: raws.count)
+        var sizes = [Measured](repeating: Measured(), count: raws.count)
         let concurrency = max(4, ProcessInfo.processInfo.activeProcessorCount)
         let paths = raws.map(\.path)
 
-        await withTaskGroup(of: (Int, Int64, Int, Date?).self) { group in
+        await withTaskGroup(of: (Int, Measured).self) { group in
             var next = 0
             func addTask(_ index: Int) {
                 let path = paths[index]
-                group.addTask {
-                    let measured = SweepScanner.measure(path)
-                    return (index, measured.bytes, measured.files, measured.newest)
-                }
+                group.addTask { (index, SweepScanner.measure(path)) }
             }
             while next < min(concurrency, paths.count) {
                 addTask(next); next += 1
             }
-            while let (index, bytes, files, newest) = await group.next() {
-                sizes[index] = (bytes, files, newest)
+            while let (index, measured) = await group.next() {
+                sizes[index] = measured
                 progress?(Self.abbreviate(paths[index]))
                 if next < paths.count {
                     addTask(next); next += 1
@@ -243,45 +242,83 @@ public final class SweepScanner: @unchecked Sendable {
         }
 
         return raws.enumerated().map { index, raw in
-            makeCandidate(raw, bytes: sizes[index].bytes, files: sizes[index].files,
-                          newest: sizes[index].newest)
+            makeCandidate(raw, measured: sizes[index])
         }
+    }
+
+    /// 크기를 잰 결과입니다.
+    struct Measured: Sendable {
+        var bytes: Int64 = 0
+        var files = 0
+        var newest: Date?
+        /// 바깥 경로와 하드링크로 공유하는 파일의 크기입니다.
+        var sharedBytes: Int64 = 0
     }
 
     /// 디렉터리가 실제로 점유한 크기입니다. du와 같은 기준(할당 크기)으로 셉니다.
     ///
     /// 어차피 트리를 전부 훑으므로 가장 최근 수정 시각도 같이 모읍니다. 따로 재면
     /// 같은 트리를 두 번 걷게 되는데, 크기 계산이 스캔 시간의 대부분이라 그건 두 배입니다.
-    static func measure(_ path: String) -> (bytes: Int64, files: Int, newest: Date?) {
+    ///
+    /// 하드링크는 따로 다룹니다. 같은 파일이 이 안에 두 번 나오면 du처럼 한 번만 셉니다.
+    /// 링크 일부가 이 바깥에 있으면 지워도 디스크가 비지 않으므로 `sharedBytes`로 따로
+    /// 모읍니다. 링크 수가 1인 보통 파일은 inode를 보지 않아서 추가 비용이 거의 없습니다.
+    static func measure(_ path: String) -> Measured {
         let url = URL(fileURLWithPath: path)
         let keys: Set<URLResourceKey> = [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey,
-                                         .isRegularFileKey, .contentModificationDateKey]
+                                         .isRegularFileKey, .contentModificationDateKey,
+                                         .linkCountKey]
         var bytes: Int64 = 0
         var files = 0
+        // inode별로 (이 안에서 본 횟수, 전체 링크 수, 크기)입니다.
+        var linked: [UInt64: (seen: Int, links: Int, size: Int64)] = [:]
         // 디렉터리 자신의 시각부터 넣습니다. 안이 비어 있으면 이것만 남습니다.
         var newest = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
             .contentModificationDate
 
         guard let enumerator = FileManager.default.enumerator(
             at: url, includingPropertiesForKeys: Array(keys), options: []) else {
-            return (0, 0, newest)
+            return Measured(newest: newest)
         }
         for case let item as URL in enumerator {
             guard let values = try? item.resourceValues(forKeys: keys),
                   values.isRegularFile == true else { continue }
-            bytes += Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
-            files += 1
+            let size = Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
             if let modified = values.contentModificationDate, modified > (newest ?? .distantPast) {
                 newest = modified
             }
+            if let links = values.linkCount, links > 1, let key = inodeKey(item.path) {
+                if var entry = linked[key] {
+                    // 이 안에서 이미 센 파일입니다. 크기는 다시 더하지 않습니다.
+                    entry.seen += 1
+                    linked[key] = entry
+                    continue
+                }
+                linked[key] = (1, links, size)
+            }
+            bytes += size
+            files += 1
         }
-        return (bytes, files, newest)
+        let shared = linked.values.reduce(Int64(0)) { sum, entry in
+            entry.seen < entry.links ? sum + entry.size : sum
+        }
+        return Measured(bytes: bytes, files: files, newest: newest, sharedBytes: shared)
+    }
+
+    /// 볼륨과 inode를 묶은 키입니다. 후보 하나는 한 볼륨 안에 있지만 마운트 지점이 섞일 수 있어 둘 다 씁니다.
+    private static func inodeKey(_ path: String) -> UInt64? {
+        var info = stat()
+        guard lstat(path, &info) == 0 else { return nil }
+        return (UInt64(UInt32(bitPattern: info.st_dev)) << 40) ^ info.st_ino
     }
 
     // MARK: - 후보 만들기
 
-    private func makeCandidate(_ raw: Raw, bytes: Int64, files: Int, newest: Date?) -> Candidate {
+    private func makeCandidate(_ raw: Raw, measured: Measured) -> Candidate {
         let project = Self.projectName(for: raw.path)
+        let bytes = measured.bytes
+        let files = measured.files
+        let newest = measured.newest
 
         if raw.unclassified {
             var c = Candidate(path: raw.path, ruleID: "unclassified",
@@ -321,7 +358,14 @@ public final class SweepScanner: @unchecked Sendable {
         // 이름이 모호해서 일부러 내린 값이라 따릅니다. 툴체인과 앱 캐시의 false는 정책이
         // 생기기 전의 값이라 따르면 표준과 최대 단계에서 고를 캐시가 하나도 남지 않습니다.
         c.defaultSelected = false
-        c.manualSelectOnly = rule.defaultSelected == false && c.category == .projectOutput
+        c.manualSelectOnly = rule.manualSelectOnly == true
+            || (rule.defaultSelected == false && c.category == .projectOutput)
+        c.sharedBytes = measured.sharedBytes
+        // 작은 공유는 알릴 가치가 없습니다. 눈에 띄는 차이가 날 때만 경고합니다.
+        if measured.sharedBytes >= 50 * 1024 * 1024 && measured.sharedBytes * 10 >= bytes {
+            c.warnings.append(L("\(Format.bytes(measured.sharedBytes))는 하드링크 공유, 그만큼 덜 빌 수 있음",
+                                "\(Format.bytes(measured.sharedBytes)) hard-linked elsewhere, may free less"))
+        }
         return c
     }
 

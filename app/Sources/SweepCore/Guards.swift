@@ -12,10 +12,14 @@ public struct SafetyGuards: Sendable {
     let gradleOwners: [String: [String]]
     /// 활성 프로젝트로 볼 기준입니다.
     let activeWithinDays: Int
+    /// 스캔에 쓴 룰셋입니다. 잠금 필드와 검사 폴더를 여기서 읽습니다. nil이면 이 맥의 룰을 읽습니다.
+    let ruleSet: RuleSet?
 
-    public init(gradleOwners: [String: [String]] = [:], activeWithinDays: Int = 30) {
+    public init(gradleOwners: [String: [String]] = [:], activeWithinDays: Int = 30,
+                ruleSet: RuleSet? = nil) {
         self.gradleOwners = gradleOwners
         self.activeWithinDays = activeWithinDays
+        self.ruleSet = ruleSet
     }
 
     public func apply(to candidates: [Candidate]) async -> [Candidate] {
@@ -23,7 +27,11 @@ public struct SafetyGuards: Sendable {
 
         // 검사 4: 실행 중인 프로세스. 목록을 한 번만 받아 전체 후보에 씁니다.
         let running = Self.runningProcesses()
-        let engine = RuleEngine()
+        let engine = ruleSet.map { RuleEngine(ruleSet: $0) } ?? RuleEngine()
+        // 검사 10에 쓸 작업 폴더 목록입니다. 프로젝트 산출물에만 씁니다.
+        let working = ProcessInspector.workingProcesses()
+        let containers = Self.containerRoots(engine.ruleSet)
+        let latestDeviceSupport = Self.latestDeviceSupport(in: result)
         // 명령줄 도구가 없는 맥에서 /usr/bin/git은 부를 때마다 설치 창을 띄웁니다.
         // 스캔마다 한 번만 확인하고, 없으면 git을 아예 부르지 않습니다.
         let gitAvailable = Self.isGitAvailable()
@@ -129,6 +137,25 @@ public struct SafetyGuards: Sendable {
                 }
             }
 
+            // node_modules는 지우는 것보다 다시 까는 쪽이 문제라 미리 체크하는 조건을 따로 둡니다.
+            if c.ruleID == "node-modules" {
+                Self.applyNodeModulesConditions(&c, repo: repo, lastCommitDays: c.lastCommitDays)
+            }
+
+            // 플랫폼마다 가장 최신 버전은 지금 쓰는 기기일 가능성이 커서 미리 체크하지 않습니다.
+            if c.ruleID == "xcode-device-support", latestDeviceSupport.contains(c.path) {
+                c.warnings.append(L("가장 최신 버전", "Newest version"))
+                c.deselectedBySafety = true
+            }
+
+            // 검사 10: 이 프로젝트 안에서 돌고 있는 프로세스. 개발 서버나 에이전트 세션이
+            // 쓰는 중인 산출물을 지우면 그 작업이 깨집니다. 이름으로는 알 수 없어 작업 폴더를 봅니다.
+            if c.category == .projectOutput,
+               let reason = Self.activeProcessReason(for: c.path, list: working, containers: containers) {
+                c.blocked = true
+                c.blockReason = reason
+            }
+
             // 검사 6: 자기 자신. 다른 검사보다 뒤에 두어야 이 사유가 화면에 남습니다.
             // 실행 중인 Sweep이 들어 있다는 게 사용자에게 가장 분명한 설명입니다.
             if Self.containsRunningSweep(c.path) {
@@ -206,6 +233,141 @@ public struct SafetyGuards: Sendable {
         return report
     }
 
+    // MARK: - 작업 중인 프로젝트
+
+    /// 프로세스가 작업 폴더로 쓰는지 볼 범위입니다. 가장 바깥 저장소가 사용자가 아는
+    /// 프로젝트 단위입니다. 저장소 밖이면 후보를 품은 폴더를 봅니다.
+    ///
+    /// `node_modules` 안의 후보(RN android/build)는 저장소 밖이어도 바깥 `node_modules`를 품은
+    /// 폴더가 프로젝트입니다. 후보의 바로 위 폴더를 쓰면 패키지 폴더가 프로젝트가 돼 버립니다.
+    public static func projectDirectory(for path: String) -> String {
+        if let root = SweepScanner.outermostGitRoot(for: path) { return root }
+        if let range = path.range(of: "/node_modules/") ?? (path.hasSuffix("/node_modules") ? path.range(of: "/node_modules", options: .backwards) : nil) {
+            return String(path[..<range.lowerBound])
+        }
+        return (path as NSString).deletingLastPathComponent
+    }
+
+    /// 후보가 속한 프로젝트에서 프로세스가 돌고 있으면 차단 사유를 돌려줍니다.
+    ///
+    /// 목록을 아예 못 받았으면(nil) 막습니다. 확인을 못 했다는 건 안전하다는 뜻이 아닙니다.
+    /// 삭제 직전에 `Sweeper`가 같은 검사를 다시 부릅니다. 스캔한 뒤 몇 시간이 지나 그 사이에
+    /// 개발 서버를 띄웠을 수 있기 때문입니다.
+    public static func activeProcessReason(for path: String, list: [WorkingProcess]?,
+                                           containers: [String]) -> String? {
+        guard let list else { return L("프로세스 확인 실패", "Couldn't check processes") }
+        let active = ProcessInspector.processes(using: projectDirectory(for: path),
+                                                containers: containers, from: list)
+        guard !active.isEmpty else { return nil }
+        let names = ProcessInspector.summary(active)
+        return L("이 프로젝트에서 \(names) 실행 중", "\(names) running in this project")
+    }
+
+    /// 프로젝트 저장소를 모아 둔 검사 폴더(walk 루트)입니다. 실제 경로로 풀어 둡니다.
+    public static func containerRoots(_ ruleSet: RuleSet) -> [String] {
+        ruleSet.roots.filter { $0.mode == .walk }.map {
+            ProcessInspector.realPath(SweepScanner.expand($0.path))
+        }
+    }
+
+    // MARK: - node_modules
+
+    /// 오래 커밋이 없어야 미리 체크합니다. 다시 설치하는 비용을 치를 일이 당분간 없다는 뜻입니다.
+    static let nodeModulesIdleCommitDays = 90
+    static let lockfiles = ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock",
+                            "pnpm-lock.yaml", "bun.lockb", "bun.lock"]
+
+    /// node_modules를 미리 체크해도 되는지 봅니다. 셋 중 하나라도 걸리면 경고를 달고 내립니다.
+    ///
+    /// - lockfile이 없으면 다시 설치할 때 버전이 달라질 수 있습니다.
+    /// - 사설 registry를 쓰면 다시 설치할 때 인증이 필요합니다. 토큰이 만료됐으면 못 받습니다.
+    /// - 최근에 커밋한 프로젝트는 곧 다시 설치하게 됩니다.
+    ///
+    /// lockfile과 `.npmrc`는 workspace 루트에 있을 수 있어 저장소 루트까지 올라가며 찾습니다.
+    static func applyNodeModulesConditions(_ c: inout Candidate, repo: String?, lastCommitDays: Int?) {
+        let fm = FileManager.default
+        let project = (c.path as NSString).deletingLastPathComponent
+        let stop = repo ?? project
+        var directories: [String] = []
+        var current = project
+        while true {
+            directories.append(current)
+            if current == stop || current.count <= stop.count { break }
+            current = (current as NSString).deletingLastPathComponent
+        }
+
+        let hasLockfile = directories.contains { dir in
+            lockfiles.contains { fm.fileExists(atPath: dir + "/" + $0) }
+        }
+        if !hasLockfile {
+            c.warnings.append(L("lockfile 없음", "No lockfile"))
+            c.deselectedBySafety = true
+        }
+
+        // 사용자 전역 설정(~/.npmrc)의 scope registry도 봅니다. 사내 패키지는 대개 여기서 scope로 겁니다.
+        let manifests = directories.compactMap { try? String(contentsOfFile: $0 + "/package.json", encoding: .utf8) }
+            .joined(separator: "\n")
+        let globalNpmrc = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".npmrc").path
+        let privateRegistry = directories.contains { usesPrivateRegistry(npmrc: $0 + "/.npmrc", manifest: manifests, projectLevel: true) }
+            || usesPrivateRegistry(npmrc: globalNpmrc, manifest: manifests, projectLevel: false)
+        if privateRegistry {
+            c.warnings.append(L("사설 registry, 재설치에 인증 필요", "Private registry, reinstall needs credentials"))
+            c.deselectedBySafety = true
+        }
+
+        if let days = lastCommitDays {
+            if days < nodeModulesIdleCommitDays {
+                c.warnings.append(L("\(days)일 전 커밋", "Last commit \(days)d ago"))
+                c.deselectedBySafety = true
+            }
+        } else {
+            // 커밋 시각을 모르면 활성도를 판단할 수 없습니다.
+            c.deselectedBySafety = true
+        }
+    }
+
+    /// 이 프로젝트가 공개 registry 말고 다른 곳에서 패키지를 받는지입니다.
+    ///
+    /// - 기본 registry(`registry=`)가 공개 registry가 아니면 모든 패키지가 그곳에서 옵니다.
+    /// - scope registry(`@corp:registry=`)는 `package.json`에 그 scope의 패키지가 있을 때만 칩니다.
+    ///   전역 설정에 사내 scope가 있어도 이 프로젝트가 안 쓰면 상관없습니다.
+    /// - 공개 registry가 아닌 곳의 토큰(`//npm.corp/:_authToken`)은 프로젝트 설정에 있을 때만 칩니다.
+    ///   전역 설정의 토큰은 다른 프로젝트 몫일 수 있습니다.
+    static func usesPrivateRegistry(npmrc path: String, manifest: String, projectLevel: Bool) -> Bool {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return false }
+        for raw in text.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("#") || line.hasPrefix(";") { continue }
+            let isPublic = line.contains("registry.npmjs.org") || line.contains("registry.yarnpkg.com")
+            if line.hasPrefix("registry"), line.contains("="), !isPublic { return true }
+            if line.hasPrefix("@"), let colon = line.range(of: ":registry"), !isPublic {
+                let scope = String(line[..<colon.lowerBound])
+                if manifest.contains("\"\(scope)/") { return true }
+            }
+            if projectLevel, line.hasPrefix("//"), line.contains("_auth"), !isPublic { return true }
+        }
+        return false
+    }
+
+    // MARK: - Xcode 기기 지원 파일
+
+    /// 플랫폼 폴더마다 버전이 가장 높은 항목의 경로입니다.
+    ///
+    /// 폴더 이름은 "17.5 (21F79)"나 "iPhone15,2 17.5 (21F79)" 모양입니다. 점이 든 첫 숫자열을
+    /// 버전으로 봅니다. 모델 번호(15,2)에는 점이 없어서 걸리지 않습니다.
+    static func latestDeviceSupport(in candidates: [Candidate]) -> Set<String> {
+        var best: [String: (path: String, version: [Int])] = [:]
+        for c in candidates where c.ruleID == "xcode-device-support" {
+            let name = (c.path as NSString).lastPathComponent
+            guard let range = name.range(of: #"[0-9]+(\.[0-9]+)+"#, options: .regularExpression) else { continue }
+            let version = name[range].split(separator: ".").compactMap { Int($0) }
+            let platform = (c.path as NSString).deletingLastPathComponent
+            if let current = best[platform], !current.version.lexicographicallyPrecedes(version) { continue }
+            best[platform] = (c.path, version)
+        }
+        return Set(best.values.map(\.path))
+    }
+
     // MARK: - 자기 자신 보호
 
     /// 지금 돌고 있는 Sweep의 실행 파일 경로입니다.
@@ -280,24 +442,35 @@ public struct SafetyGuards: Sendable {
         return (names, commandLine)
     }
 
+    /// 외부 명령을 실행하고 표준 출력을 돌려줍니다.
+    ///
+    /// `timeout`을 주면 그 시간이 지나도 끝나지 않을 때 종료시킵니다. Docker처럼 데몬에
+    /// 붙는 명령은 데몬이 멈춰 있으면 끝없이 기다리기 때문입니다.
     @discardableResult
     static func run(_ launchPath: String, _ args: [String],
-                    cwd: String? = nil, stdin: String? = nil) -> (out: String, status: Int32) {
+                    cwd: String? = nil, stdin: String? = nil,
+                    timeout: TimeInterval? = nil, environment: [String: String]? = nil,
+                    mergeStderr: Bool = false) -> (out: String, status: Int32) {
         guard FileManager.default.isExecutableFile(atPath: launchPath) else { return ("", -1) }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: launchPath)
         process.arguments = args
         if let cwd { process.currentDirectoryURL = URL(fileURLWithPath: cwd) }
+        if let environment { process.environment = environment }
 
         let outPipe = Pipe()
         process.standardOutput = outPipe
-        process.standardError = FileHandle.nullDevice
+        process.standardError = mergeStderr ? outPipe : FileHandle.nullDevice
 
         let inPipe = Pipe()
         if stdin != nil { process.standardInput = inPipe }
 
         do { try process.run() } catch { return ("", -1) }
+
+        let killer = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        if let timeout { DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer) }
+        defer { killer.cancel() }
 
         if let stdin, let data = stdin.data(using: .utf8) {
             inPipe.fileHandleForWriting.write(data)
