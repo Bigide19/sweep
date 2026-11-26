@@ -69,6 +69,11 @@ final class AppModel {
     /// 다시 그릴 계기가 없는 자리에서는 처음 읽은 값에 머뭅니다. 그래서 상태로 들고 있습니다.
     var disk: Format.DiskUsage = Format.disk()
 
+    /// 여유 공간이 줄었을 때 알릴지입니다.
+    var lowDiskAlertEnabled: Bool = UserDefaults.standard.object(forKey: "lowDiskAlertEnabled") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(lowDiskAlertEnabled, forKey: "lowDiskAlertEnabled") }
+    }
+
     // 설정
     var autoScanInterval: AutoScanInterval {
         didSet {
@@ -158,6 +163,26 @@ final class AppModel {
 
     func refreshDisk() {
         disk = Format.disk()
+        checkLowDisk()
+    }
+
+    /// 여유 공간이 임계치 아래로 내려간 순간 한 번 알립니다.
+    ///
+    /// 알렸다는 상태를 저장해 둡니다. 저장하지 않으면 이미 부족한 맥에서 앱을 켤 때마다 알립니다.
+    private func checkLowDisk() {
+        guard lowDiskAlertEnabled, !needsSetup, disk.total > 0 else { return }
+        let key = "lowDiskAlerted"
+        let decision = LowDiskAlert.evaluate(free: disk.free, total: disk.total,
+                                             alerted: UserDefaults.standard.bool(forKey: key))
+        UserDefaults.standard.set(decision.alerted, forKey: key)
+        guard decision.notify else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = L("남은 공간 \(Format.bytes(disk.free))", "\(Format.bytes(disk.free)) left")
+        content.body = L("디스크가 \(disk.percent)% 찼습니다. Sweep에서 정리할 항목을 확인하세요.",
+                         "Your disk is \(disk.percent)% full. Open Sweep to review what can go.")
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
     }
 
     /// 메뉴바 라벨에 사용률이 걸려 있어서 주기적으로 다시 읽어야 합니다.
@@ -225,8 +250,9 @@ final class AppModel {
         result?.candidates.filter { $0.category == category } ?? []
     }
 
+    /// 고른 후보입니다. 바깥 후보와 그 안의 후보를 함께 골랐으면 바깥만 셉니다.
     var selectedCandidates: [Candidate] {
-        result?.candidates.filter { selected.contains($0.path) && $0.isDeletable } ?? []
+        Candidate.withoutNested(result?.candidates.filter { selected.contains($0.path) && $0.isDeletable } ?? [])
     }
 
     var selectedBytes: Int64 {
@@ -299,6 +325,7 @@ final class AppModel {
         // 애니메이션을 확인할 때 실제 파일을 지우지 않으려고 둔 스위치입니다.
         // `defaults write kr.bigide.sweep debugDryRunDelete -bool YES`로 켭니다.
         let dryRun = UserDefaults.standard.bool(forKey: "debugDryRunDelete")
+        let freeBefore = Format.disk().free
 
         let (events, continuation) = AsyncStream<(Candidate, Sweeper.ItemResult)>.makeStream()
         sweepTask = Task.detached(priority: .userInitiated) {
@@ -333,6 +360,12 @@ final class AppModel {
 
         totalReclaimed = Sweeper.totalReclaimed()
         var parts = [L("\(Format.bytes(reclaimed)) 회수", "Reclaimed \(Format.bytes(reclaimed))")]
+        // 회수량은 지운 파일의 크기 합이라 하드링크 공유분까지 셉니다. 실제로 늘어난 남은 공간이
+        // 눈에 띄게 적으면 같이 보여 줍니다. 다른 프로그램의 쓰기도 섞이는 참고값입니다.
+        let gained = Format.disk().free - freeBefore
+        if !dryRun, reclaimed > 0, gained < reclaimed / 2 {
+            parts.append(L("남은 공간은 \(Format.bytes(max(0, gained))) 늘어남", "free space grew by \(Format.bytes(max(0, gained)))"))
+        }
         if stopped { parts.append(L("멈춤", "stopped")) }
         if let first = failures.first {
             // 실패는 첫 건의 사유까지 보여줍니다. 개수만 보여주면 왜 실패했는지 알 길이 없습니다.

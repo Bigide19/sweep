@@ -370,7 +370,7 @@ struct MenuView: View {
 
     private func categoryHeader(_ category: SweepCategory, deletable: [Candidate],
                                 isCollapsed: Bool) -> some View {
-        let sum = deletable.reduce(Int64(0)) { $0 + $1.bytes }
+        let sum = Candidate.withoutNested(deletable).reduce(Int64(0)) { $0 + $1.bytes }
 
         return HStack(spacing: 6) {
             Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
@@ -484,6 +484,7 @@ struct MenuView: View {
                         }
                     }
                     Toggle(L("로그인 시 실행", "Launch at Login"), isOn: $model.launchAtLogin)
+                    Toggle(L("남은 공간이 부족하면 알림", "Notify When Space Runs Low"), isOn: $model.lowDiskAlertEnabled)
                     Divider()
                     Button(L("룰 설정…", "Rules…")) { model.showRulesWindow?() }
                     Button(L("삭제 이력", "Deletion History")) { model.revealHistory() }
@@ -691,6 +692,7 @@ private struct CostChip: View {
         case .slow:       return ("hourglass", L("10분+", "10+ min"), .orange)
         case .download:   return ("arrow.down.circle", L("다운로드", "Download"), .secondary)
         case .reindex:    return ("magnifyingglass", L("재색인", "Reindex"), .secondary)
+        case .reinstall:  return ("shippingbox", L("재설치", "Reinstall"), .orange)
         // 다시 만들 일이 없으니 보여줄 비용도 없습니다.
         case .disposable: return nil
         }

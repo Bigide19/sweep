@@ -16,6 +16,7 @@ public enum RegenerateCost: String, Codable, Sendable, CaseIterable {
     case quick         // 1~2분 (Gradle transforms처럼 로컬에서 다시 풀기만 하면 되는 것)
     case slow          // 10분 이상 (Android 네이티브 컴파일)
     case download      // 네트워크 재다운로드가 필요합니다 (npm/NuGet 캐시)
+    case reinstall     // 프로젝트에서 패키지 설치를 다시 돌려야 합니다 (node_modules)
     case reindex       // IDE 인덱스 재생성
     case disposable    // 로그처럼 다시 만들 필요가 없는 것
 
@@ -25,6 +26,7 @@ public enum RegenerateCost: String, Codable, Sendable, CaseIterable {
         case .quick:    return L("재생성 2분 안팎", "Rebuilds in about 2 minutes")
         case .slow:     return L("재빌드 10분 이상", "Rebuild takes 10+ minutes")
         case .download: return L("재다운로드", "Downloads again")
+        case .reinstall: return L("패키지 재설치", "Reinstall packages")
         case .reindex:  return L("다음에 열 때 재색인", "Reindexes on next open")
         case .disposable: return L("재생성 불필요", "Nothing to rebuild")
         }
@@ -38,6 +40,8 @@ public enum RegenerateCost: String, Codable, Sendable, CaseIterable {
         case .reindex: return 2
         case .slow: return 3
         case .download: return 4
+        // 다시 받는 데 더해 프로젝트마다 설치 명령을 돌려야 하고, 네이티브 모듈은 빌드까지 합니다.
+        case .reinstall: return 5
         }
     }
 }
@@ -121,6 +125,11 @@ public struct Rule: Codable, Sendable, Identifiable {
     /// Gradle 데몬처럼 실행 파일은 `java`이고 인수에만 이름이 드러나는 경우에 씁니다.
     public let lockCommands: [String]?
 
+    /// true면 어느 단계에서도 미리 체크하지 않습니다. 지우는 건 안전하지만 다시 받는 양이
+    /// 커서 사람이 직접 판단해야 하는 것(로컬 AI 모델)에 씁니다. 예전 룰 파일에는 없는
+    /// 필드라 옵셔널입니다.
+    public let manualSelectOnly: Bool?
+
     public init(
         id: String,
         kind: RuleKind,
@@ -132,7 +141,8 @@ public struct Rule: Codable, Sendable, Identifiable {
         note: String? = nil,
         defaultSelected: Bool? = nil,
         lockProcesses: [String]? = nil,
-        lockCommands: [String]? = nil
+        lockCommands: [String]? = nil,
+        manualSelectOnly: Bool? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -145,6 +155,7 @@ public struct Rule: Codable, Sendable, Identifiable {
         self.defaultSelected = defaultSelected
         self.lockProcesses = lockProcesses
         self.lockCommands = lockCommands
+        self.manualSelectOnly = manualSelectOnly
     }
 }
 
@@ -180,6 +191,9 @@ public struct Candidate: Sendable, Identifiable, Codable, Hashable {
     public var title: String?
     public var bytes: Int64
     public var fileCount: Int
+    /// 이 안의 파일 중 바깥과 하드링크로 공유하는 몫입니다. 지워도 이만큼은 디스크가
+    /// 비지 않을 수 있습니다. pnpm 프로젝트의 node_modules가 스토어와 이렇게 공유합니다.
+    public var sharedBytes: Int64 = 0
 
     /// 소속 프로젝트 이름입니다. ~/Projects 밖이면 nil입니다.
     public var project: String?
@@ -232,6 +246,24 @@ public struct Candidate: Sendable, Identifiable, Codable, Hashable {
 
     /// 실제로 지울 수 있는 상태인지입니다.
     public var isDeletable: Bool { !blocked && !unclassified }
+
+    /// 다른 후보 안에 든 후보를 뺍니다.
+    ///
+    /// `node_modules`는 통째로 후보가 되면서 그 안의 RN `android/build`도 따로 후보로
+    /// 남습니다. 바깥이 잠겼을 때 안쪽만이라도 지울 수 있게 하려는 것입니다. 둘을 함께
+    /// 고르면 크기를 두 번 세고, 바깥을 먼저 지운 뒤 안쪽은 "이미 없는 경로"로 실패합니다.
+    /// 합계를 내거나 지우기 전에 이걸 거칩니다.
+    public static func withoutNested(_ candidates: [Candidate]) -> [Candidate] {
+        let paths = Set(candidates.map(\.path))
+        return candidates.filter { candidate in
+            var current = (candidate.path as NSString).deletingLastPathComponent
+            while current.count > 1 {
+                if paths.contains(current) { return false }
+                current = (current as NSString).deletingLastPathComponent
+            }
+            return true
+        }
+    }
 }
 
 /// 스캔 한 번의 결과 전체입니다.
@@ -263,7 +295,7 @@ public struct ScanResult: Sendable, Codable {
 
     /// 지울 수 있는 후보의 합계입니다.
     public var reclaimableBytes: Int64 {
-        candidates.filter(\.isDeletable).reduce(0) { $0 + $1.bytes }
+        Candidate.withoutNested(candidates.filter(\.isDeletable)).reduce(0) { $0 + $1.bytes }
     }
 
     public var totalBytes: Int64 {

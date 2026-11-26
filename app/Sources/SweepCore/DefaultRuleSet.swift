@@ -9,7 +9,7 @@ public enum DefaultRuleSet {
 
     public static let dirNames: [String] = [
         "build", "bin", "obj", ".cxx", ".gradle", "target", ".dart_tool", ".build",
-        "dist", "Pods", "DerivedData",
+        "dist", "Pods", "DerivedData", "node_modules",
         ".next", ".nuxt", ".turbo", ".svelte-kit", ".parcel-cache", ".angular",
     ]
 
@@ -51,6 +51,16 @@ public enum DefaultRuleSet {
         .init(path: "~/Library/pnpm/store", mode: .leaf),
         .init(path: "~/Library/Developer/Xcode/DerivedData", mode: .leaf),
         .init(path: "~/Library/Developer/CoreSimulator/Caches", mode: .leaf),
+        // 기기를 연결할 때마다 OS 버전별로 하나씩 쌓입니다. 버전 하나가 수 GB입니다.
+        .init(path: "~/Library/Developer/Xcode/iOS DeviceSupport", mode: .children),
+        .init(path: "~/Library/Developer/Xcode/watchOS DeviceSupport", mode: .children),
+        .init(path: "~/Library/Developer/Xcode/tvOS DeviceSupport", mode: .children),
+        .init(path: "~/Library/Developer/Xcode/visionOS DeviceSupport", mode: .children),
+        .init(path: "~/.cargo/registry", mode: .leaf),
+        .init(path: "~/.cargo/git", mode: .leaf),
+        .init(path: "~/.m2/repository", mode: .leaf),
+        // ~/.pub-cache/bin에는 dart pub global activate로 깐 실행 파일이 있어 통째로 잡지 않습니다.
+        .init(path: "~/.pub-cache/hosted", mode: .leaf),
 
         // AI 에이전트. Application Support는 앱 데이터가 섞여 있어 children으로 훑지 않고
         // 캐시 폴더만 하나씩 집습니다. 같은 폴더의 vm_bundles는 세션 데이터 이미지가 들어
@@ -59,6 +69,7 @@ public enum DefaultRuleSet {
         .init(path: "~/Library/Application Support/Claude/Cache", mode: .leaf),
         .init(path: "~/Library/Application Support/Claude/Code Cache", mode: .leaf),
         .init(path: "~/Library/Application Support/Claude/GraphiteDawnCache", mode: .leaf),
+        .init(path: "~/.ollama/models", mode: .leaf),
 
         // 앱 캐시. 화이트리스트에 없는 항목은 성격을 모르므로 크기만 보여주고 삭제는 막습니다.
         .init(path: "~/Library/Caches", mode: .children),
@@ -112,6 +123,12 @@ public enum DefaultRuleSet {
              regex: #"/packages/[^/]+/(build|bin|obj|lib|tools|ref|runtimes)$"#,
              note: L("NuGet 패키지에 들어 있는 파일입니다.", "Files shipped in a NuGet package.")),
 
+        // 전역으로 설치한 npm 패키지입니다(`npm i -g`). 프로젝트의 node_modules와 모양이
+        // 같지만 지우면 설치한 CLI가 사라지고, 다시 깔아 줄 프로젝트도 없습니다.
+        Rule(id: "node-global-packages", kind: .deny, priority: 60,
+             regex: #"/lib/node_modules$"#,
+             note: L("전역으로 설치한 npm 패키지입니다.", "Globally installed npm packages.")),
+
         // npm 패키지가 배포한 코드입니다. next/dist/build, yargs/build 등이 여기 걸립니다.
         // 아래 rn-native-build 룰이 우선순위로 이겨서 android/build만 예외가 됩니다.
         Rule(id: "node-package-code", kind: .deny, priority: 50,
@@ -152,6 +169,16 @@ public enum DefaultRuleSet {
              title: L("iOS 빌드 산출물", "iOS build output"),
              defaultSelected: true,
              lockProcesses: ["Xcode", "xcodebuild"]),
+
+        // 프로젝트 루트의 node_modules입니다. 중첩된 node_modules는 바깥에 포함되므로
+        // 맨 바깥 것만 잡습니다. 기본 선택 여부는 안전장치가 정합니다. 오래 커밋이 없고,
+        // lockfile이 있고, 사설 registry를 쓰지 않을 때만 미리 체크합니다.
+        Rule(id: "node-modules", kind: .allow, priority: 40,
+             regex: #"^(?!.*/node_modules/).*/node_modules$"#,
+             category: .projectOutput, cost: .reinstall,
+             title: L("npm 패키지 설치본", "Installed npm packages"),
+             note: L("그 프로젝트에서 npm install(또는 pnpm, yarn, bun install)을 다시 돌리면 됩니다. 같은 버전으로 받으려면 lockfile이 있어야 합니다.", "Run npm install (or pnpm, yarn, bun install) in that project again. A lockfile keeps the same versions."),
+             defaultSelected: true),
 
         Rule(id: "cocoapods-dir", kind: .allow, priority: 45,
              regex: #"/Pods$"#,
@@ -284,6 +311,39 @@ public enum DefaultRuleSet {
              defaultSelected: true,
              lockProcesses: ["Xcode", "xcodebuild"]),
 
+        // 안전장치가 플랫폼마다 가장 최신 버전은 미리 체크하지 않습니다. 지금 쓰는 기기일 가능성이 큽니다.
+        Rule(id: "xcode-device-support", kind: .allow, priority: 100,
+             regex: #"/Developer/Xcode/(iOS|watchOS|tvOS|visionOS) DeviceSupport/[^/]+$"#,
+             category: .toolchainCache, cost: .slow,
+             title: L("Xcode 기기 지원 파일", "Xcode device support"),
+             note: L("그 버전의 기기를 다시 연결하면 Xcode가 기호 파일을 다시 복사합니다. 몇 분 걸립니다.", "Xcode copies the symbols again when a device on that version connects. Takes a few minutes."),
+             defaultSelected: false,
+             lockProcesses: ["Xcode"]),
+
+        Rule(id: "cargo-registry", kind: .allow, priority: 100,
+             regex: #"/\.cargo/(registry|git)$"#,
+             category: .toolchainCache, cost: .download,
+             title: L("Cargo 레지스트리", "Cargo registry"),
+             note: L("크레이트 원본과 압축 해제본입니다. ~/.cargo/bin의 설치 도구는 건드리지 않습니다.", "Crate sources and archives. Tools in ~/.cargo/bin are untouched."),
+             defaultSelected: false,
+             lockProcesses: ["cargo", "rust-analyzer"]),
+
+        Rule(id: "maven-repo", kind: .allow, priority: 100,
+             regex: #"/\.m2/repository$"#,
+             category: .toolchainCache, cost: .download,
+             title: L("Maven 로컬 저장소", "Maven local repository"),
+             note: L("사내 저장소에서만 받는 의존성이 있으면 다시 받을 때 인증이 필요합니다.", "Dependencies from a private repository need credentials to download again."),
+             defaultSelected: false,
+             lockCommands: ["org.codehaus.plexus.classworlds", "GradleDaemon"]),
+
+        Rule(id: "pub-cache", kind: .allow, priority: 100,
+             regex: #"/\.pub-cache/hosted$"#,
+             category: .toolchainCache, cost: .download,
+             title: L("Dart/Flutter 패키지 캐시", "Dart/Flutter package cache"),
+             note: L("flutter pub get이 다시 받습니다.", "flutter pub get downloads them again."),
+             defaultSelected: false,
+             lockProcesses: ["dart", "flutter"]),
+
         Rule(id: "simulator-cache", kind: .allow, priority: 100,
              regex: #"/CoreSimulator/Caches$"#,
              category: .toolchainCache, cost: .quick,
@@ -330,6 +390,17 @@ public enum DefaultRuleSet {
              title: L("Claude Code MCP 로그", "Claude Code MCP logs"),
              note: L("MCP 서버 로그입니다.", "MCP server logs."),
              defaultSelected: true),
+
+        // 로컬에서 돌리는 모델 파일입니다. 지워도 다시 받으면 되지만 하나가 수 GB라
+        // 어느 단계에서도 미리 체크하지 않습니다.
+        Rule(id: "ai-local-models", kind: .allow, priority: 100,
+             regex: #"/(\.cache/huggingface|\.ollama/models)$"#,
+             category: .aiAgent, cost: .download,
+             title: L("로컬 AI 모델", "Local AI models"),
+             note: L("Hugging Face, Ollama로 받은 모델입니다. 쓰는 모델은 다시 받아야 합니다.", "Models pulled with Hugging Face or Ollama. Models in use download again."),
+             defaultSelected: false,
+             lockProcesses: ["ollama"],
+             manualSelectOnly: true),
 
         Rule(id: "ai-copilot-index", kind: .allow, priority: 100,
              regex: #"/\.cache/github-copilot$"#,
@@ -387,7 +458,7 @@ public enum DefaultRuleSet {
 
         // ~/.cache 안에서 성격이 분명한 것만 골라냅니다.
         Rule(id: "dotcache-known", kind: .allow, priority: 100,
-             regex: #"/\.cache/(puppeteer|ms-playwright|mongodb-binaries|yarn|pip|uv|deno|go-build|golangci-lint|turbo|nx|prisma|huggingface|electron|node-gyp|pre-commit|bazel|typescript|selenium|Cypress|jedi|matplotlib)$"#,
+             regex: #"/\.cache/(puppeteer|ms-playwright|mongodb-binaries|yarn|pip|uv|deno|go-build|golangci-lint|turbo|nx|prisma|electron|node-gyp|pre-commit|bazel|typescript|selenium|Cypress|jedi|matplotlib)$"#,
              category: .appCache, cost: .download,
              title: L("도구 캐시", "Tool cache"),
              defaultSelected: true),
