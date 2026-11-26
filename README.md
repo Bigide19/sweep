@@ -23,7 +23,7 @@
 
 When a disk fills up, sizes are easy to find. What you will have to redo after deleting is not. Sweep puts a rebuild cost on every candidate and leaves the choice to you.
 
-It covers Xcode DerivedData, Gradle and npm caches, NuGet packages, Rust `target`, `.next`, `.build` and other build folders inside your projects. The full list is in the [rule reference](docs/rules.md).
+It covers Xcode DerivedData and device support files, Gradle, npm, Cargo and Maven caches, NuGet packages, local AI models, the `node_modules` of projects you have left alone, Rust `target`, `.next`, `.build` and other build folders inside your projects. The full list is in the [rule reference](docs/rules.md).
 
 ## Install
 
@@ -39,16 +39,19 @@ This installs `/Applications/Sweep.app`. To launch without installing, pass `--r
 
 ## What it does
 
-- **Shows the cost of regenerating.** Each candidate is tagged as an instant rebuild, about 2 minutes, 10+ minutes, or a re-download. The same 1GB can be cheap or expensive to lose.
+- **Shows the cost of regenerating.** Each candidate is tagged as an instant rebuild, about 2 minutes, 10+ minutes, a re-download, or a package reinstall. The same 1GB can be cheap or expensive to lose.
 - **Picks what has sat idle longest.** Default selection depends on the days since the last change. Yesterday's npm cache is not treated like a year-old build.
 - **Checks the real state before offering a delete.** A folder named `build` may be output or hand-written files. Paths tracked by git, folders with uncommitted changes, and caches in use are blocked.
+- **Stays out of projects in use.** If a dev server or an agent session is running in a project, that project's output is blocked, and Sweep checks again right before deleting.
 - **Leaves unknown things alone.** Anything under `~/Library/Caches` that is not on the list only shows its size and stays locked.
+- **Points at the big things it won't delete.** VM images, the Docker disk image, unavailable simulators and local snapshots are listed with their size and how to shrink them. Where the tool has its own cleanup command (Docker build cache, `simctl delete unavailable`), Sweep can run it.
 
 <details>
-<summary>All 9 safety checks</summary>
+<summary>All 10 safety checks</summary>
 
 | Check | Result |
 |---|---|
+| A process is running in that project (dev server, agent session) | Blocked |
 | Path tracked by git | Blocked |
 | Contains uncommitted changes | Blocked |
 | A process using that cache is running | Blocked |
@@ -59,7 +62,7 @@ This installs `/Applications/Sweep.app`. To launch without installing, pass `--r
 | Build output outside any git repository | Warning, not pre-selected |
 | Project committed recently | Warning, only for slow rebuilds |
 
-`dist` and `Pods` may be maintained by hand, so they are never pre-selected.
+`dist` and `Pods` may be maintained by hand, so they are never pre-selected. A `node_modules` is pre-selected only when the project has had no commit for 90 days, has a lockfile, and does not use a private registry.
 
 </details>
 
@@ -86,6 +89,8 @@ Click the menu bar icon to open the panel. Next to the icon you see disk usage a
 
 If a ransomware-protection tool blocks a delete, allow it when asked. A blocked item shows the file name and how much is left.
 
+When free space drops below 10% or 10GB, Sweep sends one notification. It notifies again only after free space has recovered past 15% and 15GB. Turn it off in the `⋯` menu.
+
 Scan folders, excluded paths and per-rule toggles live in the Rules window, opened from the `⋯` menu. The display language (한국어, English) is in the same menu.
 
 <img src="docs/images/en/rules.png" alt="Rules window" width="546" />
@@ -96,8 +101,10 @@ Scan folders, excluded paths and per-rule toggles live in the Rules window, open
 ```bash
 cd app && swift build -c release
 
-.build/release/sweep scan          # list candidates
+.build/release/sweep scan          # list candidates (--json for scripts)
 .build/release/sweep clean --yes   # delete pre-selected candidates
+.build/release/sweep clean --path ~/Projects/app/node_modules --yes   # pick by path
+.build/release/sweep report        # large items Sweep leaves, and how to shrink them
 .build/release/sweep rules         # active rules
 .build/release/sweep history       # deletion history
 .build/release/sweep verify        # rule regression test
