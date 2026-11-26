@@ -442,6 +442,16 @@ func runVerify() async {
     let big = LowDiskAlert.evaluate(free: 8 * gb, total: 8 * 1024 * gb, alerted: false)
     check("비율이 넉넉해도 10GB 아래면 알립니다", big.notify)
 
+    let dockerSample = #"""
+    {"Active":"10","Reclaimable":"10.5GB (67%)","Size":"15.49GB","TotalCount":"41","Type":"Images"}
+    {"Active":"0","Reclaimable":"881.5MB","Size":"5.101GB","TotalCount":"152","Type":"Build Cache"}
+    """#
+    let parsed = InsightScanner.parseDockerDF(dockerSample)
+    check("docker system df 출력에서 build cache 회수량을 읽습니다",
+          parsed.first { $0.type == "Build Cache" }?.reclaimable == "881.5MB")
+    check("비율이 붙은 회수량은 크기만 남깁니다",
+          parsed.first { $0.type == "Images" }?.reclaimable == "10.5GB")
+
     print("")
     print("  \(Ansi.bold)선택 정책 검증\(Ansi.reset)")
     print("")
@@ -777,6 +787,53 @@ func runClean() async {
     print("")
 }
 
+// MARK: - 지우지 않는 큰 항목
+
+func runReport() {
+    let insights = InsightScanner.scan(includeDownloads: flags.contains("--downloads"))
+    print("")
+    print("  \(Ansi.bold)지우지 않는 큰 항목\(Ansi.reset)  \(Ansi.dim)Sweep이 지우지 않고 줄이는 방법만 알려 줍니다\(Ansi.reset)")
+    print("")
+    guard !insights.isEmpty else {
+        print("  \(Ansi.dim)눈에 띄게 큰 항목이 없습니다\(Ansi.reset)")
+        print("")
+        return
+    }
+    for insight in insights {
+        let size = insight.bytes.map(Format.bytes) ?? "-"
+        print("  \(size.leftPadded(to: 8))  \(Ansi.bold)\(insight.title)\(Ansi.reset)")
+        if let path = insight.path { print("            \(Ansi.dim)\(SweepScanner.abbreviate(path))\(Ansi.reset)") }
+        print("            \(insight.detail)")
+        if let action = insight.action {
+            print("            \(Ansi.cyan)sweep run \(action.id)\(Ansi.reset)  \(Ansi.dim)\(action.commandLine)\(Ansi.reset)")
+        }
+        print("")
+    }
+}
+
+func runAction() {
+    guard arguments.count >= 2, let id = arguments.dropFirst().first(where: { !$0.hasPrefix("-") }) else {
+        print("실행할 정리 명령을 지정하세요. sweep report에 나온 이름을 씁니다.")
+        exit(1)
+    }
+    guard let action = InsightScanner.scan().compactMap(\.action).first(where: { $0.id == id }) else {
+        print("지금 실행할 수 없는 명령입니다: \(id)")
+        print("\(Ansi.dim)sweep report에 나온 명령만 실행합니다. Docker 정리는 Docker가 켜져 있어야 합니다.\(Ansi.reset)")
+        exit(1)
+    }
+    print("")
+    print("  \(action.title)  \(Ansi.dim)\(action.commandLine)\(Ansi.reset)")
+    guard flags.contains("--yes") else {
+        print("  \(Ansi.yellow)미리보기입니다. 실행하려면 --yes 를 붙이세요.\(Ansi.reset)")
+        print("")
+        return
+    }
+    let result = InsightScanner.run(action)
+    print(result.output.split(separator: "\n").suffix(5).map { "    " + $0 }.joined(separator: "\n"))
+    print(result.succeeded ? "  \(Ansi.green)완료\(Ansi.reset)" : "  \(Ansi.red)실패\(Ansi.reset)")
+    print("")
+}
+
 func runRules() {
     if flags.contains("--export") {
         if let data = try? RuleEngine.exportDefaults(), let text = String(data: data, encoding: .utf8) {
@@ -819,6 +876,8 @@ func usage() {
         sweep clean --rule <id>    특정 룰에 걸린 것만
         sweep clean --index 1,3,5  번호로 골라서
         sweep clean --exclude <경로>  고른 것 중 이 경로 아래는 빼고
+        sweep report [--downloads] 지우지 않는 큰 항목과 줄이는 방법
+        sweep run <명령> [--yes]   report에 나온 도구 정리 명령을 실행합니다
         sweep verify               룰 판정과 안전장치를 검증합니다
         sweep rules [--export]     룰 목록 / JSON 내보내기
         sweep history              누적 회수량
@@ -832,6 +891,8 @@ case "scan":    await runScan()
 case "clean":   await runClean()
 case "verify":  await runVerify()
 case "rules":   runRules()
+case "report":  runReport()
+case "run":     runAction()
 case "history": runHistory()
 case "roots":
     let started = Date()
